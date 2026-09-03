@@ -1,0 +1,108 @@
+# OpenReply auf dem Hetzner-VPS (alles auf einer Maschine).
+#
+# Start (aus /opt/openreply):
+#   docker compose --env-file .env -f deploy/docker-compose.vps.yml up -d --build
+#
+# Fünf Dienste, ein Image:
+#   postgres  - Datenbank (nur im Docker-Netz erreichbar)
+#   redis     - BullMQ-Queue + Rate-Limiter (nur im Docker-Netz)
+#   web       - Next.js: Dashboard, OAuth-Callback, Webhook (127.0.0.1:3040 -> nginx)
+#   worker    - sendet die DMs, Polling-Reconciler, Follow-Gate
+#   cron      - ruft /api/cron/* auf (Token-Refresh täglich, attach-next-reel alle 5 min)
+#
+# Alle Secrets kommen aus /opt/openreply/.env (gitignored, nie im Repo).
+# DATABASE_URL und REDIS_URL in der .env müssen auf die Docker-Hostnamen zeigen:
+#   DATABASE_URL=postgresql://openreply:<POSTGRES_PASSWORD>@postgres:5432/openreply
+#   REDIS_URL=redis://redis:6379
+
+name: openreply
+
+x-app: &app
+  image: openreply:latest
+  restart: unless-stopped
+  env_file:
+    - ../.env
+  networks:
+    - openreply
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD fehlt in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - openreply
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply -d openreply"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    networks:
+      - openreply
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  web:
+    <<: *app
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # Migrationen laufen beim Start (nicht beim Build): erst dann ist Postgres im Netz erreichbar.
+    command: ["sh", "-c", "npx prisma migrate deploy && npm run start"]
+    ports:
+      - "127.0.0.1:3040:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /api/health antwortet 503 solange der Worker-Heartbeat fehlt; für "web lebt" reicht 200 oder 503.
+      test: ["CMD-SHELL", "wget -q --server-response --spider http://localhost:3000/api/health 2>&1 | grep -qE 'HTTP/1.1 (200|503)'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  worker:
+    <<: *app
+    command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+
+  cron:
+    <<: *app
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      CRON_BASE_URL: http://web:3000
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  openreply:
+    driver: bridge
